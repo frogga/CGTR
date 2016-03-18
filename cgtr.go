@@ -12,6 +12,7 @@ import (
 	"time"
 	"flag"
 	"strings"
+	"sync"
 )
 type CGProbe struct{
 	Ttl uint8
@@ -37,9 +38,14 @@ var (
 	err error
 	Infomap=[...]string{"srcip","dstip","firstip","secondip","thirdip"}
 	IPinfo map[string]net.IP
-	Probeinfo map[uint32]CGProbe
+	Probeinfo = struct {
+		sync.RWMutex
+		m map[uint32]CGProbe
+	}{m: make(map[uint32]CGProbe)}
 	Eth *net.Interface
 	GwMAC net.HardwareAddr
+	wg sync.WaitGroup
+	rcount int
 	LinkTTL = flag.Int("ttl",0,"The TTL value to reach the first IP in triplet")
 	Payloadsize = flag.Int("S",64,"TCP payload size for the probe packets")
 	Eth_str =flag.String("i","","Network interface for outgoing packets")
@@ -104,7 +110,7 @@ func random_payload(p []byte) (n int, err error) {
 	}
 }
 
-func craft_packet(TTLstart int, IPmap map[string]net.IP, Probemap map[uint32]CGProbe,chan_probe chan<- *CGProbe){
+func craft_packet(TTLstart int, IPmap map[string]net.IP, chan_probe chan<- *CGProbe){
 	var buffer gopacket.SerializeBuffer
 	var options gopacket.SerializeOptions
 	var eth_layer *layers.Ethernet
@@ -168,7 +174,9 @@ func craft_packet(TTLstart int, IPmap map[string]net.IP, Probemap map[uint32]CGP
 				ComputeChecksums: true,
 			}
 			gopacket.SerializeLayers(p.Buf,options,eth_layer,ip_layer,tcp_layer,gopacket.Payload(payload),)
-			Probemap[seq] = p
+			Probemap.Lock()
+			Probemap.m[seq] = p
+			Probemap.Unlock()
 			//schedule the packet
 			chan_probe<-p
 		}
@@ -223,21 +231,26 @@ func parsepacket(pkt gopacket.Packet){
   	switch layerType {
   		case layers.LayerTypeTCP:
   			//This shd be the outgoing probes. Check the tcp sequence number. just quick check here. we shd further verify other fields in later version
-  			if  _, exist:=Probeinfo[tcpl.Seq]; exist {
+  			Probeinfo.RLock()
+  			if  _, exist:=Probeinfo.m[tcpl.Seq]; exist {
   				Probeinfo[tcpl.Seq].TsSend = pkt.Metadata().CaptureInfo.Timestamp
   				log.Println("Got outgoing packet: ts %v seq %v", pkt.Metadata().CaptureInfo.Timestamp, tcpl.Seq)
   			}
+  			Probeinfo.RUnlock()
   		case layers.LayerTypeICMPv4:
   			//check if this is a response packet
   			if icmpv4l.TypeCode.Type()== layers.ICMPv4TypeTimeExceeded && icmpv4l.TypeCode.Code()==layers.ICMPv4CodeTTLExceeded {
   				//TTL exceeded packet
   				log.Println("Payload: %x",pkt.Payload())
   				//it should contains the original IP packet header
-  				
+  				rcount++
   			}
   		
   		//chan_response<-packet
   	}
+	}
+	if rcount==6 {
+		wg.Done()
 	}
 }
 
@@ -250,7 +263,7 @@ func cgtr_do(){
 
 func main(){
 	IPinfo = make(map[string]net.IP)
-	Probeinfo = make(map[uint32]CGProbe)
+	//Probeinfo = make(map[uint32]CGProbe)
 	flag.Parse()
 	if IPinfo["dstip"]=net.ParseIP(*Dstip_str); IPinfo["dstip"]==nil || IPinfo["dstip"].To4()==nil {
 		log.Fatalln("Input: Destination IP is incorrect or not set")
@@ -282,6 +295,7 @@ func main(){
 	if err=initpcap(Eth); err!=nil {
 		log.Fatalln("pcap failed: %s",err)
 	}
+	rcount = 0
 	chan_probe:=make(chan CGProbe)
 	defer close(chan_probe)
 	chan_response:=make(chan CGProbe)
@@ -289,5 +303,14 @@ func main(){
 	go sendpcap (handle, &chan_probe, Probeinfo)
 	go recvpcap (handle, &chan_response, Probeinfo)
 	
+	craft_packet(*LinkTTL, IPinfo, &chan_probe)
+	//TTLstart int, IPmap map[string]net.IP, chan_probe chan<- *CGProbe){
+	go func(){
+		time.Sleep(time.Second*3)
+		//timeout
+		wg.Done()
+	}()
+	//wait either timeout or received 6 icmp messages
+	wg.Wait()
 	
 }
