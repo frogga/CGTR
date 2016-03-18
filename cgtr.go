@@ -17,7 +17,7 @@ import (
 type CGProbe struct{
 	Ttl uint8
 	Id uint16
-	Buf gopacket.NewSerializeBuffer
+	Buf gopacket.SerializeBuffer
 	TsPrep time.Time
 	TsSend time.Time
 	TsRecv time.Time
