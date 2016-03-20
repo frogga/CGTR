@@ -13,6 +13,10 @@ import (
 	"flag"
 	"strings"
 	"sync"
+	"bytes"
+	"encoding/binary"
+	"reflect"
+	"fmt"
 )
 type CGProbe struct{
 	Ttl uint8
@@ -40,8 +44,8 @@ var (
 	IPinfo map[string]net.IP
 	Probeinfo = struct {
 		sync.RWMutex
-		m map[uint32]CGProbe
-	}{m: make(map[uint32]CGProbe)}
+		m map[uint32]*CGProbe
+	}{m: make(map[uint32]*CGProbe)}
 	Eth *net.Interface
 	GwMAC net.HardwareAddr
 	wg sync.WaitGroup
@@ -97,7 +101,7 @@ func random_payload(p []byte) (n int, err error) {
 	todo := len(p)
 	offset := 0
 	for {
-		val := int64(r.src.Int63())
+		val := int64(rand.Int63())
 		for i := 0; i < 8; i++ {
 			p[offset] = byte(val & 0xff)
 			todo--
@@ -110,8 +114,8 @@ func random_payload(p []byte) (n int, err error) {
 	}
 }
 
-func craft_packet(TTLstart int, IPmap map[string]net.IP, chan_probe chan<- *CGProbe){
-	var buffer gopacket.SerializeBuffer
+func craft_packet(TTLstart int, IPmap map[string]net.IP, chan_probe chan<- CGProbe){
+//	var buffer gopacket.SerializeBuffer
 	var options gopacket.SerializeOptions
 	var eth_layer *layers.Ethernet
 	var ip_layer *layers.IPv4
@@ -121,8 +125,11 @@ func craft_packet(TTLstart int, IPmap map[string]net.IP, chan_probe chan<- *CGPr
 	 
 	//send them 1 second later
 	tsstart :=time.Now().Add(time.Duration(1)*time.Second)
-	payload = make([]byte,Payloadsize)
+	payload = make([]byte,*Payloadsize)
 	n,err:=random_payload(payload)
+	if err!=nil {
+		log.Println("Generate payload failed")
+	}
 	log.Println("Made %d byte payload",n)
 	r :=rand.New(rand.NewSource(99))
 
@@ -131,25 +138,27 @@ func craft_packet(TTLstart int, IPmap map[string]net.IP, chan_probe chan<- *CGPr
 			p:=&CGProbe{}
 			p.Ttl = uint8(TTLstart+i)
 			p.Id = uint16(r.Intn(20480))
-			seq=uint32(r.Intn(100000)*100+i*10+j) //random number multiplies by 100 to shift two digit left
+			seq:=uint32(r.Intn(100000)*100+i*10+j) //random number multiplies by 100 to shift two digit left
 			log.Println("Creating probe id %v id %v",p.Id,seq)
 			p.TsPrep = tsstart
 			//add 1 us here to perserve the sending sequence
 			tsstart = tsstart.Add(time.Duration(1)*time.Microsecond)
 			//craft the ip options
-			optbuf:=new (bytes.Buffer)
-			tsoption:=IPTimeStampOption{Pointer:uint8(4+8*3+1),Oflwflg:uint8(3),Ip1:Infomap["firstip"],Ts1:uint32(0),Ip2:Infomap["secondip"],Ts2:uint32(0),Ip3:Infomap["thirdip"],Ts3:uint32(0)}
-			for _, v :=range tsoption {
-				err := binary.Write(optbuf,binaryBigEndian,v)
+			optbuf:=new(bytes.Buffer)
+			tsoption:=IPTimeStampOption{Pointer:uint8(4+8*3+1),Oflwflg:uint8(3),Ip1:IPinfo["firstip"],Ts1:uint32(0),Ip2:IPinfo["secondip"],Ts2:uint32(0),Ip3:IPinfo["thirdip"],Ts3:uint32(0)}
+			v:=reflect.ValueOf(tsoption)
+			
+			for i:=0; i<v.NumField(); i++ {
+				err := binary.Write(optbuf,binary.BigEndian,v.Field(i).Interface())
 				if err != nil {
 					log.Println("binary.Write failed:", err)
 				}
 			}
 			optlen:=2+len(optbuf.Bytes())
-			
-			ipopt:=[]layers.IPv4Option{layers.IPv4Option{OptionType:uint8(0x44), OptionLength:uint8(optlen),optbuf.Bytes()}}
+			opt:=layers.IPv4Option{OptionType:uint8(0x44), OptionLength:uint8(optlen),OptionData:optbuf.Bytes()}
+			ipopt:=[]layers.IPv4Option{opt}
 			eth_layer = &layers.Ethernet {
-				SrcMAC: *Eth.HardwareAddr,
+				SrcMAC: Eth.HardwareAddr,
 				DstMAC: GwMAC,
 				EthernetType: 0x0800,
 			}
@@ -160,8 +169,8 @@ func craft_packet(TTLstart int, IPmap map[string]net.IP, chan_probe chan<- *CGPr
 		  	TTL: p.Ttl,
 		  	Options: ipopt,
 			}
-			tcp_layer = &layer.TCP {
-				SrcPort: layersTCPPort(25555),
+			tcp_layer = &layers.TCP {
+				SrcPort: layers.TCPPort(25555),
 				DstPort: layers.TCPPort(80),
 				Seq: seq, 
 				PSH: true,
@@ -174,11 +183,11 @@ func craft_packet(TTLstart int, IPmap map[string]net.IP, chan_probe chan<- *CGPr
 				ComputeChecksums: true,
 			}
 			gopacket.SerializeLayers(p.Buf,options,eth_layer,ip_layer,tcp_layer,gopacket.Payload(payload),)
-			Probemap.Lock()
-			Probemap.m[seq] = p
-			Probemap.Unlock()
+			Probeinfo.Lock()
+			Probeinfo.m[seq] = p
+			Probeinfo.Unlock()
 			//schedule the packet
-			chan_probe<-p
+			chan_probe<-*p
 		}
 	}
 }
@@ -197,8 +206,8 @@ func initpcap(iface *net.Interface, ipmap map[string]net.IP) (*pcap.Handle, erro
 	return handle,nil
 }
 
-func sendpcap(handle *pcap.Handle, chan_outprobe chan<- *CGProbe){
-	for probe :=range chan_probe {
+func sendpcap(handle *pcap.Handle, chan_outprobe <-chan CGProbe){
+	for probe :=range chan_outprobe {
 		go preparesend(handle,probe.Buf.Bytes(),probe.TsPrep)
 	}
 }
@@ -208,7 +217,7 @@ func preparesend(handle *pcap.Handle, pck []byte, t time.Time){
 	handle.WritePacketData(pck)
 }
 
-func recvpcap(handle *pcap.Handle, chan_response <-chan *CGProbe){
+func recvpcap(handle *pcap.Handle, chan_response <-chan CGProbe){
 	
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
   for packet := range packetSource.Packets() {
@@ -224,16 +233,19 @@ func parsepacket(pkt gopacket.Packet){
 	var icmpv4l layers.ICMPv4
 	var tcpl layers.TCP
 		
-	parser := gopacket.NewDecodingLayerParser(layers.LayerTyperEthernet, &ethl, &ipv4l, &icmpv4l, &tcpl)
+	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &ethl, &ipv4l, &icmpv4l, &tcpl)
 	decoded :=[]gopacket.LayerType{}
-	err:=parser.DecodeLayers(pkt, &decoded)
+	err:=parser.DecodeLayers(pkt.Data(), &decoded)
+	if err!=nil{
+		log.Println("Decode layer failed")
+	}
 	for _, layerType := range decoded {
   	switch layerType {
   		case layers.LayerTypeTCP:
   			//This shd be the outgoing probes. Check the tcp sequence number. just quick check here. we shd further verify other fields in later version
   			Probeinfo.RLock()
   			if  _, exist:=Probeinfo.m[tcpl.Seq]; exist {
-  				Probeinfo[tcpl.Seq].TsSend = pkt.Metadata().CaptureInfo.Timestamp
+  				Probeinfo.m[tcpl.Seq].TsSend = pkt.Metadata().CaptureInfo.Timestamp
   				log.Println("Got outgoing packet: ts %v seq %v", pkt.Metadata().CaptureInfo.Timestamp, tcpl.Seq)
   			}
   			Probeinfo.RUnlock()
@@ -241,7 +253,7 @@ func parsepacket(pkt gopacket.Packet){
   			//check if this is a response packet
   			if icmpv4l.TypeCode.Type()== layers.ICMPv4TypeTimeExceeded && icmpv4l.TypeCode.Code()==layers.ICMPv4CodeTTLExceeded {
   				//TTL exceeded packet
-  				log.Println("Payload: %x",pkt.Payload())
+  				log.Println("Payload: %x",pkt.ApplicationLayer().Payload())
   				//it should contains the original IP packet header
   				rcount++
   			}
@@ -262,6 +274,7 @@ func cgtr_do(){
 }
 
 func main(){
+	var handle *pcap.Handle
 	IPinfo = make(map[string]net.IP)
 	//Probeinfo = make(map[uint32]CGProbe)
 	flag.Parse()
@@ -292,7 +305,7 @@ func main(){
 		log.Printf("Got %s:%s\n",Infomap[i],IPinfo[Infomap[i]].String())
 	}
 	
-	if err=initpcap(Eth); err!=nil {
+	if handle,err=initpcap(Eth,IPinfo); err!=nil {
 		log.Fatalln("pcap failed: %s",err)
 	}
 	rcount = 0
@@ -300,10 +313,10 @@ func main(){
 	defer close(chan_probe)
 	chan_response:=make(chan CGProbe)
 	defer close(chan_response)
-	go sendpcap (handle, &chan_probe, Probeinfo)
-	go recvpcap (handle, &chan_response, Probeinfo)
+	go sendpcap (handle, chan_probe)
+	go recvpcap (handle, chan_response)
 	
-	craft_packet(*LinkTTL, IPinfo, &chan_probe)
+	craft_packet(*LinkTTL, IPinfo, chan_probe)
 	//TTLstart int, IPmap map[string]net.IP, chan_probe chan<- *CGProbe){
 	go func(){
 		time.Sleep(time.Second*3)
