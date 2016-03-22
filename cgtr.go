@@ -49,6 +49,7 @@ var (
 	Eth *net.Interface
 	GwMAC net.HardwareAddr
 	wg sync.WaitGroup
+	wgpcap sync.WaitGroup
 	rcount int
 	LinkTTL = flag.Int("ttl",0,"The TTL value to reach the first IP in triplet")
 	Payloadsize = flag.Int("S",64,"TCP payload size for the probe packets")
@@ -114,7 +115,24 @@ func random_payload(p []byte) (n int, err error) {
 	}
 }
 
-func craft_packet(TTLstart int, IPmap map[string]net.IP, chan_probe chan<- CGProbe){
+func one_payload(p []byte) (n int, err error) {
+	todo := len(p)
+	offset := 0
+	for {
+		val := int64(0xffffffffffff)
+		for i := 0; i < 8; i++ {
+			p[offset] = byte(val & 0x01)
+			todo--
+			if todo == 0 {
+				return len(p), nil
+			}
+			offset++
+			val >>= 8
+		}
+	}
+}
+
+func craft_packet(TTLstart int, IPmap map[string]net.IP, chan_probe chan<- *CGProbe){
 //	var buffer gopacket.SerializeBuffer
 	var options gopacket.SerializeOptions
 	var eth_layer *layers.Ethernet
@@ -126,11 +144,12 @@ func craft_packet(TTLstart int, IPmap map[string]net.IP, chan_probe chan<- CGPro
 	//send them 1 second later
 	tsstart :=time.Now().Add(time.Duration(1)*time.Second)
 	payload = make([]byte,*Payloadsize)
-	n,err:=random_payload(payload)
+	//n,err:=random_payload(payload)
+	n,err:=one_payload(payload)
 	if err!=nil {
 		log.Println("Generate payload failed")
 	}
-	log.Println("Made %d byte payload",n)
+	log.Println("Made byte payload",n)
 	r :=rand.New(rand.NewSource(99))
 
 	for i:=0; i<3; i++ {
@@ -138,14 +157,15 @@ func craft_packet(TTLstart int, IPmap map[string]net.IP, chan_probe chan<- CGPro
 			p:=&CGProbe{}
 			p.Ttl = uint8(TTLstart+i)
 			p.Id = uint16(r.Intn(20480))
-			seq:=uint32(r.Intn(100000)*100+i*10+j) //random number multiplies by 100 to shift two digit left
-			log.Println("Creating probe id %v id %v",p.Id,seq)
+			//seq:=uint32(r.Intn(100000)*100+i*10+j) //random number multiplies by 100 to shift two digit left
+			seq:=uint32(100000*100+i*10+j) 
+			log.Println("Creating probe id, seq",p.Id,seq)
 			p.TsPrep = tsstart
 			//add 1 us here to perserve the sending sequence
 			tsstart = tsstart.Add(time.Duration(1)*time.Microsecond)
 			//craft the ip options
 			optbuf:=new(bytes.Buffer)
-			tsoption:=IPTimeStampOption{Pointer:uint8(4+8*3+1),Oflwflg:uint8(3),Ip1:IPinfo["firstip"],Ts1:uint32(0),Ip2:IPinfo["secondip"],Ts2:uint32(0),Ip3:IPinfo["thirdip"],Ts3:uint32(0)}
+			tsoption:=IPTimeStampOption{Pointer:uint8(4+1),Oflwflg:uint8(3),Ip1:IPinfo["firstip"].To4(),Ts1:uint32(0),Ip2:IPinfo["secondip"].To4(),Ts2:uint32(0),Ip3:IPinfo["thirdip"].To4(),Ts3:uint32(0)}
 			v:=reflect.ValueOf(tsoption)
 			
 			for i:=0; i<v.NumField(); i++ {
@@ -155,6 +175,7 @@ func craft_packet(TTLstart int, IPmap map[string]net.IP, chan_probe chan<- CGPro
 				}
 			}
 			optlen:=2+len(optbuf.Bytes())
+			fmt.Println("optionlen: ",optlen)
 			opt:=layers.IPv4Option{OptionType:uint8(0x44), OptionLength:uint8(optlen),OptionData:optbuf.Bytes()}
 			ipopt:=[]layers.IPv4Option{opt}
 			eth_layer = &layers.Ethernet {
@@ -163,20 +184,25 @@ func craft_packet(TTLstart int, IPmap map[string]net.IP, chan_probe chan<- CGPro
 				EthernetType: 0x0800,
 			}
 			ip_layer = &layers.IPv4{
+				Version: uint8(0x4),
+				//IHL: uint8(0x9),
 		  	SrcIP: IPmap["srcip"],
 		  	DstIP: IPmap["dstip"],
 		  	Id: p.Id ,
-		  	TTL: p.Ttl,
+		  	TTL: p.Ttl+uint8(i),
+		  	Flags: layers.IPv4DontFragment,
+		  	Protocol: layers.IPProtocolTCP,
 		  	Options: ipopt,
 			}
 			tcp_layer = &layers.TCP {
 				SrcPort: layers.TCPPort(25555),
 				DstPort: layers.TCPPort(80),
+				Window: 1500,
 				Seq: seq, 
 				PSH: true,
 				ACK: true,
 			}
-			
+			tcp_layer.SetNetworkLayerForChecksum(ip_layer)
 			p.Buf=gopacket.NewSerializeBuffer()
 			options=gopacket.SerializeOptions{
 				FixLengths:       true,
@@ -186,18 +212,20 @@ func craft_packet(TTLstart int, IPmap map[string]net.IP, chan_probe chan<- CGPro
 			Probeinfo.Lock()
 			Probeinfo.m[seq] = p
 			Probeinfo.Unlock()
+			fmt.Printf("Buf: %x \n",p.Buf.Bytes())
 			//schedule the packet
-			chan_probe<-*p
+			chan_probe<-p
 		}
 	}
 }
 
 func initpcap(iface *net.Interface, ipmap map[string]net.IP) (*pcap.Handle, error){
+	log.Println("Initpcap: ",iface.Name)
 	handle, err := pcap.OpenLive(iface.Name, 65536, true, pcap.BlockForever)
 	if err != nil {
 		return nil,err
 	}
-	defer handle.Close()
+	
 	filter := fmt.Sprintf("icmp or host %s",ipmap["dstip"].String())
 	err = handle.SetBPFFilter(filter)
 	if err!=nil {
@@ -206,8 +234,10 @@ func initpcap(iface *net.Interface, ipmap map[string]net.IP) (*pcap.Handle, erro
 	return handle,nil
 }
 
-func sendpcap(handle *pcap.Handle, chan_outprobe <-chan CGProbe){
+func sendpcap(handle *pcap.Handle, chan_outprobe <-chan *CGProbe){
+	log.Println("Send ready")
 	for probe :=range chan_outprobe {
+		
 		go preparesend(handle,probe.Buf.Bytes(),probe.TsPrep)
 	}
 }
@@ -217,9 +247,11 @@ func preparesend(handle *pcap.Handle, pck []byte, t time.Time){
 	handle.WritePacketData(pck)
 }
 
-func recvpcap(handle *pcap.Handle, chan_response <-chan CGProbe){
-	
+func recvpcap(handle *pcap.Handle, chan_response <-chan *CGProbe){
+	log.Println("Recv prep ",handle, handle.LinkType())
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
+	log.Println("Recv ready")
+	wgpcap.Done()
   for packet := range packetSource.Packets() {
   	fmt.Println(packet)
   	//parse the packet
@@ -302,20 +334,22 @@ func main(){
 		if IPinfo[Infomap[i+2]]==nil || IPinfo[Infomap[i+2]].To4()==nil {
 			log.Fatalln("Input: %s error",Infomap[i])
 		}
-		log.Printf("Got %s:%s\n",Infomap[i],IPinfo[Infomap[i]].String())
+		log.Printf("Got %s:%s\n",Infomap[i+2],IPinfo[Infomap[i+2]].String())
 	}
 	
 	if handle,err=initpcap(Eth,IPinfo); err!=nil {
 		log.Fatalln("pcap failed: %s",err)
 	}
+	defer handle.Close()
 	rcount = 0
-	chan_probe:=make(chan CGProbe)
+	chan_probe:=make(chan *CGProbe)
 	defer close(chan_probe)
-	chan_response:=make(chan CGProbe)
+	chan_response:=make(chan *CGProbe)
 	defer close(chan_response)
+	wgpcap.Add(1)
 	go sendpcap (handle, chan_probe)
 	go recvpcap (handle, chan_response)
-	
+	wgpcap.Wait()
 	craft_packet(*LinkTTL, IPinfo, chan_probe)
 	//TTLstart int, IPmap map[string]net.IP, chan_probe chan<- *CGProbe){
 	go func(){
