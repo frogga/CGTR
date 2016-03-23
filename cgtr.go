@@ -253,7 +253,6 @@ func recvpcap(handle *pcap.Handle, chan_response <-chan *CGProbe){
 	log.Println("Recv ready")
 	wgpcap.Done()
   for packet := range packetSource.Packets() {
-  	fmt.Println(packet)
   	//parse the packet
   	parsepacket(packet)
 	}
@@ -264,28 +263,32 @@ func parsepacket(pkt gopacket.Packet){
 	var ipv4l layers.IPv4
 	var icmpv4l layers.ICMPv4
 	var tcpl layers.TCP
+	var payl gopacket.Payload
 		
-	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &ethl, &ipv4l, &icmpv4l, &tcpl)
+	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &ethl, &ipv4l, &icmpv4l, &tcpl,&payl)
 	decoded :=[]gopacket.LayerType{}
 	err:=parser.DecodeLayers(pkt.Data(), &decoded)
 	if err!=nil{
-		log.Println("Decode layer failed")
+		log.Println("Decode layer failed ",err)
 	}
 	for _, layerType := range decoded {
   	switch layerType {
   		case layers.LayerTypeTCP:
   			//This shd be the outgoing probes. Check the tcp sequence number. just quick check here. we shd further verify other fields in later version
+  			log.Printf("Got TCP packet\n")
   			Probeinfo.RLock()
   			if  _, exist:=Probeinfo.m[tcpl.Seq]; exist {
   				Probeinfo.m[tcpl.Seq].TsSend = pkt.Metadata().CaptureInfo.Timestamp
-  				log.Println("Got outgoing packet: ts %v seq %v", pkt.Metadata().CaptureInfo.Timestamp, tcpl.Seq)
+  				log.Printf("Got outgoing packet: ts %v seq %v", pkt.Metadata().CaptureInfo.Timestamp, tcpl.Seq)
+  			}else{
+  				fmt.Println(pkt)
   			}
   			Probeinfo.RUnlock()
   		case layers.LayerTypeICMPv4:
   			//check if this is a response packet
   			if icmpv4l.TypeCode.Type()== layers.ICMPv4TypeTimeExceeded && icmpv4l.TypeCode.Code()==layers.ICMPv4CodeTTLExceeded {
   				//TTL exceeded packet
-  				log.Println("Payload: %x",pkt.ApplicationLayer().Payload())
+  				log.Printf("Got ICMP TTL, Payload: %x \n",pkt.ApplicationLayer().Payload())
   				//it should contains the original IP packet header
   				rcount++
   			}
@@ -307,6 +310,7 @@ func cgtr_do(){
 
 func main(){
 	var handle *pcap.Handle
+	var handlerecv *pcap.Handle
 	IPinfo = make(map[string]net.IP)
 	//Probeinfo = make(map[uint32]CGProbe)
 	flag.Parse()
@@ -336,11 +340,16 @@ func main(){
 		}
 		log.Printf("Got %s:%s\n",Infomap[i+2],IPinfo[Infomap[i+2]].String())
 	}
-	
+	//the pcap handler for sending packets
 	if handle,err=initpcap(Eth,IPinfo); err!=nil {
 		log.Fatalln("pcap failed: %s",err)
 	}
+	//the pcap handler for recv packets
+	if handlerecv,err=initpcap(Eth,IPinfo); err!=nil {
+		log.Fatalln("pcap failed: %s",err)
+	}
 	defer handle.Close()
+	defer handlerecv.Close()
 	rcount = 0
 	chan_probe:=make(chan *CGProbe)
 	defer close(chan_probe)
@@ -348,14 +357,16 @@ func main(){
 	defer close(chan_response)
 	wgpcap.Add(1)
 	go sendpcap (handle, chan_probe)
-	go recvpcap (handle, chan_response)
+	go recvpcap (handlerecv, chan_response)
 	wgpcap.Wait()
 	craft_packet(*LinkTTL, IPinfo, chan_probe)
 	//TTLstart int, IPmap map[string]net.IP, chan_probe chan<- *CGProbe){
+	wg.Add(1)
 	go func(){
-		time.Sleep(time.Second*3)
+		time.Sleep(time.Second*5)
 		//timeout
 		wg.Done()
+		log.Println("Timeout")
 	}()
 	//wait either timeout or received 6 icmp messages
 	wg.Wait()
