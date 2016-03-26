@@ -30,11 +30,11 @@ type CGProbe struct{
 type IPTimeStampOption struct {
 	Pointer uint8
 	Oflwflg uint8
-	Ip1 net.IP
+	Ip1 uint32
 	Ts1 uint32
-	Ip2 net.IP
+	Ip2 uint32
 	Ts2 uint32
-	Ip3 net.IP
+	Ip3 uint32
 	Ts3 uint32
 }
 
@@ -132,6 +132,15 @@ func one_payload(p []byte) (n int, err error) {
 	}
 }
 
+func IPtouint32(addr net.IP) (u uint32){
+	ip4:=addr.To4()
+	u|=uint32(ip4[3])
+	u|=uint32(ip4[2])<<8
+	u|=uint32(ip4[1])<<16
+	u|=uint32(ip4[0])<<24
+	return
+}
+
 func craft_packet(TTLstart int, IPmap map[string]net.IP, chan_probe chan<- *CGProbe){
 //	var buffer gopacket.SerializeBuffer
 	var options gopacket.SerializeOptions
@@ -165,11 +174,11 @@ func craft_packet(TTLstart int, IPmap map[string]net.IP, chan_probe chan<- *CGPr
 			tsstart = tsstart.Add(time.Duration(1)*time.Microsecond)
 			//craft the ip options
 			optbuf:=new(bytes.Buffer)
-			tsoption:=IPTimeStampOption{Pointer:uint8(4+1),Oflwflg:uint8(3),Ip1:IPinfo["firstip"].To4(),Ts1:uint32(0),Ip2:IPinfo["secondip"].To4(),Ts2:uint32(0),Ip3:IPinfo["thirdip"].To4(),Ts3:uint32(0)}
+			tsoption:=IPTimeStampOption{Pointer:uint8(4+1),Oflwflg:uint8(3),Ip1:IPtouint32(IPinfo["firstip"]),Ts1:uint32(0),Ip2:IPtouint32(IPinfo["secondip"]),Ts2:uint32(0),Ip3:IPtouint32(IPinfo["thirdip"]),Ts3:uint32(0)}
 			v:=reflect.ValueOf(tsoption)
 			
-			for i:=0; i<v.NumField(); i++ {
-				err := binary.Write(optbuf,binary.BigEndian,v.Field(i).Interface())
+			for k:=0; k<v.NumField(); k++ {
+				err := binary.Write(optbuf,binary.BigEndian,v.Field(k).Interface())
 				if err != nil {
 					log.Println("binary.Write failed:", err)
 				}
@@ -189,7 +198,7 @@ func craft_packet(TTLstart int, IPmap map[string]net.IP, chan_probe chan<- *CGPr
 		  	SrcIP: IPmap["srcip"],
 		  	DstIP: IPmap["dstip"],
 		  	Id: p.Id ,
-		  	TTL: p.Ttl+uint8(i),
+		  	TTL: p.Ttl,
 		  	Flags: layers.IPv4DontFragment,
 		  	Protocol: layers.IPProtocolTCP,
 		  	Options: ipopt,
@@ -266,7 +275,12 @@ func parsepacket(pkt gopacket.Packet){
 	var payl gopacket.Payload
 		
 	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &ethl, &ipv4l, &icmpv4l, &tcpl,&payl)
+	//parser_icmppayload := gopacket.NewDecodingLayerParser(layers.LayerTypeIPv4,&ipv4l,&tcpl,&payl)
+	
+	
 	decoded :=[]gopacket.LayerType{}
+	//decoded_icmp := []gopacket.LayerType{}
+	
 	err:=parser.DecodeLayers(pkt.Data(), &decoded)
 	if err!=nil{
 		log.Println("Decode layer failed ",err)
@@ -290,6 +304,21 @@ func parsepacket(pkt gopacket.Packet){
   				//TTL exceeded packet
   				log.Printf("Got ICMP TTL, Payload: %x \n",pkt.ApplicationLayer().Payload())
   				//it should contains the original IP packet header
+  				tmpp:=gopacket.NewPacket(pkt.ApplicationLayer().Payload(), layers.LayerTypeIPv4, gopacket.NoCopy)
+  				//err=parser.DecodeLayers(pkt.ApplicationLayer().Payload(), &decoded_icmp)
+  				if tmpiplayer:=tmpp.Layer(layers.LayerTypeIPv4); tmpiplayer!=nil {
+  					tmpip,_ :=tmpiplayer.(*layers.IPv4)
+  					log.Printf("Org IP header: %v %v\n", tmpip.SrcIP, tmpip.Id)
+  					tmpipopt:=IPTimeStampOption{}
+  					buf:=bytes.NewBuffer(tmpip.Options[0].OptionData)
+  					err=binary.Read(buf ,binary.BigEndian,&tmpipopt )
+  					if err!=nil{
+  						log.Println("Fail to parse IP option ",err)
+  					}else{
+  						log.Printf("Org IP Option ts1: %v ts2 %v ts3: %v\n",tmpipopt.Ts1,tmpipopt.Ts2,tmpipopt.Ts3 )
+  					}
+  				}
+  				
   				rcount++
   			}
   		
