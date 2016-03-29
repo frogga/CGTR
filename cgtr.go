@@ -25,6 +25,8 @@ type CGProbe struct{
 	TsPrep time.Time
 	TsSend time.Time
 	TsRecv time.Time
+	RespIP net.IP
+	Internetts []uint32
 }
 //we assume three IPs here
 type IPTimeStampOption struct {
@@ -44,8 +46,8 @@ var (
 	IPinfo map[string]net.IP
 	Probeinfo = struct {
 		sync.RWMutex
-		m map[uint32]*CGProbe
-	}{m: make(map[uint32]*CGProbe)}
+		m map[uint16]*CGProbe
+	}{m: make(map[uint16]*CGProbe)}
 	Eth *net.Interface
 	GwMAC net.HardwareAddr
 	wg sync.WaitGroup
@@ -58,6 +60,9 @@ var (
 	Dstip_str = flag.String("d","","The destination IP address")
 	Triplet_str = flag.String("l","","Comma seperated triplet IP")
 	GatewayMAC_str = flag.String("m","FF:FF:FF:FF:FF:FF","Network gateway's MAC address")
+	Numpacket = flag.Int("n",5,"Number of probe packets to each IP")
+	Gap = flag.Int("g",0,"The spacing between probe packet in us")
+	Tout = flag.Int("T",5,"Timeout in second")
 )
 
 //get the external IP if it is not provided
@@ -162,16 +167,17 @@ func craft_packet(TTLstart int, IPmap map[string]net.IP, chan_probe chan<- *CGPr
 	r :=rand.New(rand.NewSource(99))
 
 	for i:=0; i<3; i++ {
-		for j:=0; j<2; j++{
+		for j:=0; j<*Numpacket; j++{
 			p:=&CGProbe{}
 			p.Ttl = uint8(TTLstart+i)
 			p.Id = uint16(r.Intn(20480))
 			//seq:=uint32(r.Intn(100000)*100+i*10+j) //random number multiplies by 100 to shift two digit left
 			seq:=uint32(100000*100+i*10+j) 
-			log.Println("Creating probe id, seq",p.Id,seq)
+			
 			p.TsPrep = tsstart
 			//add 1 us here to perserve the sending sequence
-			tsstart = tsstart.Add(time.Duration(1)*time.Microsecond)
+			tsstart = tsstart.Add(time.Duration(*Gap)*time.Microsecond)
+			log.Println("Creating probe id, seq, ts",p.Id,seq, tsstart)
 			//craft the ip options
 			optbuf:=new(bytes.Buffer)
 			tsoption:=IPTimeStampOption{Pointer:uint8(4+1),Oflwflg:uint8(3),Ip1:IPtouint32(IPinfo["firstip"]),Ts1:uint32(0),Ip2:IPtouint32(IPinfo["secondip"]),Ts2:uint32(0),Ip3:IPtouint32(IPinfo["thirdip"]),Ts3:uint32(0)}
@@ -184,7 +190,7 @@ func craft_packet(TTLstart int, IPmap map[string]net.IP, chan_probe chan<- *CGPr
 				}
 			}
 			optlen:=2+len(optbuf.Bytes())
-			fmt.Println("optionlen: ",optlen)
+			//fmt.Println("optionlen: ",optlen)
 			opt:=layers.IPv4Option{OptionType:uint8(0x44), OptionLength:uint8(optlen),OptionData:optbuf.Bytes()}
 			ipopt:=[]layers.IPv4Option{opt}
 			eth_layer = &layers.Ethernet {
@@ -204,10 +210,11 @@ func craft_packet(TTLstart int, IPmap map[string]net.IP, chan_probe chan<- *CGPr
 		  	Options: ipopt,
 			}
 			tcp_layer = &layers.TCP {
-				SrcPort: layers.TCPPort(25555),
+				SrcPort: layers.TCPPort(25500+i*10+j),
 				DstPort: layers.TCPPort(80),
 				Window: 1500,
 				Seq: seq, 
+				//SYN:true,
 				PSH: true,
 				ACK: true,
 			}
@@ -219,9 +226,9 @@ func craft_packet(TTLstart int, IPmap map[string]net.IP, chan_probe chan<- *CGPr
 			}
 			gopacket.SerializeLayers(p.Buf,options,eth_layer,ip_layer,tcp_layer,gopacket.Payload(payload),)
 			Probeinfo.Lock()
-			Probeinfo.m[seq] = p
+			Probeinfo.m[uint16(25500+i*10+j)] = p
 			Probeinfo.Unlock()
-			fmt.Printf("Buf: %x \n",p.Buf.Bytes())
+			//fmt.Printf("Buf: %x \n",p.Buf.Bytes())
 			//schedule the packet
 			chan_probe<-p
 		}
@@ -246,7 +253,6 @@ func initpcap(iface *net.Interface, ipmap map[string]net.IP) (*pcap.Handle, erro
 func sendpcap(handle *pcap.Handle, chan_outprobe <-chan *CGProbe){
 	log.Println("Send ready")
 	for probe :=range chan_outprobe {
-		
 		go preparesend(handle,probe.Buf.Bytes(),probe.TsPrep)
 	}
 }
@@ -256,18 +262,20 @@ func preparesend(handle *pcap.Handle, pck []byte, t time.Time){
 	handle.WritePacketData(pck)
 }
 
-func recvpcap(handle *pcap.Handle, chan_response <-chan *CGProbe){
+func recvpcap(handle *pcap.Handle, chan_response <-chan *CGProbe, wgp, wgsent *sync.WaitGroup){
 	log.Println("Recv prep ",handle, handle.LinkType())
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 	log.Println("Recv ready")
-	wgpcap.Done()
+	wgp.Done()
   for packet := range packetSource.Packets() {
   	//parse the packet
-  	parsepacket(packet)
+  	if done:=parsepacket(packet,wgsent); done{
+  		return
+  	}
 	}
 }
 
-func parsepacket(pkt gopacket.Packet){
+func parsepacket(pkt gopacket.Packet, wgsent *sync.WaitGroup)bool{
 	var ethl layers.Ethernet
 	var ipv4l layers.IPv4
 	var icmpv4l layers.ICMPv4
@@ -285,49 +293,114 @@ func parsepacket(pkt gopacket.Packet){
 	if err!=nil{
 		log.Println("Decode layer failed ",err)
 	}
+	
 	for _, layerType := range decoded {
   	switch layerType {
   		case layers.LayerTypeTCP:
   			//This shd be the outgoing probes. Check the tcp sequence number. just quick check here. we shd further verify other fields in later version
-  			log.Printf("Got TCP packet\n")
+  			//log.Printf("Got TCP packet\n")
   			Probeinfo.RLock()
-  			if  _, exist:=Probeinfo.m[tcpl.Seq]; exist {
-  				Probeinfo.m[tcpl.Seq].TsSend = pkt.Metadata().CaptureInfo.Timestamp
-  				log.Printf("Got outgoing packet: ts %v seq %v", pkt.Metadata().CaptureInfo.Timestamp, tcpl.Seq)
+  			if  _, exist:=Probeinfo.m[uint16(tcpl.SrcPort)]; exist {
+  				Probeinfo.RUnlock()
+  				Probeinfo.Lock()
+  				Probeinfo.m[uint16(tcpl.SrcPort)].TsSend = pkt.Metadata().CaptureInfo.Timestamp
+  				Probeinfo.Unlock()
+  				log.Printf("Got outgoing packet: ts %v sport %d seq %v", pkt.Metadata().CaptureInfo.Timestamp, tcpl.SrcPort, tcpl.Seq)
+  				goto parsefinish
   			}else{
-  				fmt.Println(pkt)
+  				//packet reach destination?
+  				prid:=uint16(tcpl.DstPort)
+  				if _, exist:=Probeinfo.m[prid]; exist && ipv4l.SrcIP.Equal(IPinfo["dstip"]) {
+  					Probeinfo.RUnlock()
+  					tmpipopt:=IPTimeStampOption{}
+  					buf:=bytes.NewBuffer(ipv4l.Options[0].OptionData)
+  					err=binary.Read(buf ,binary.BigEndian,&tmpipopt )
+  					Probeinfo.Lock()
+  					Probeinfo.m[prid].RespIP = ipv4l.SrcIP
+  					Probeinfo.m[prid].TsRecv = pkt.Metadata().CaptureInfo.Timestamp
+  					Probeinfo.m[prid].Internetts=[]uint32{tmpipopt.Ts1,tmpipopt.Ts2,tmpipopt.Ts3}
+  					Probeinfo.Unlock()
+  					log.Printf("RST IP Option Port: %d ts: %v ts1: %v ts2 %v ts3: %v\n", tcpl.DstPort, pkt.Metadata().CaptureInfo.Timestamp,tmpipopt.Ts1,tmpipopt.Ts2,tmpipopt.Ts3 )
+  					rcount++
+  					
+  				}else{
+  					Probeinfo.RUnlock()
+  				}
+  				goto parsefinish
+  				//fmt.Println(pkt)
   			}
-  			Probeinfo.RUnlock()
+  			
   		case layers.LayerTypeICMPv4:
   			//check if this is a response packet
   			if icmpv4l.TypeCode.Type()== layers.ICMPv4TypeTimeExceeded && icmpv4l.TypeCode.Code()==layers.ICMPv4CodeTTLExceeded {
   				//TTL exceeded packet
-  				log.Printf("Got ICMP TTL, Payload: %x \n",pkt.ApplicationLayer().Payload())
+  				//log.Printf("Got ICMP TTL \n")
   				//it should contains the original IP packet header
   				tmpp:=gopacket.NewPacket(pkt.ApplicationLayer().Payload(), layers.LayerTypeIPv4, gopacket.NoCopy)
   				//err=parser.DecodeLayers(pkt.ApplicationLayer().Payload(), &decoded_icmp)
   				if tmpiplayer:=tmpp.Layer(layers.LayerTypeIPv4); tmpiplayer!=nil {
   					tmpip,_ :=tmpiplayer.(*layers.IPv4)
-  					log.Printf("Org IP header: %v %v\n", tmpip.SrcIP, tmpip.Id)
+  					rcount++
   					tmpipopt:=IPTimeStampOption{}
   					buf:=bytes.NewBuffer(tmpip.Options[0].OptionData)
   					err=binary.Read(buf ,binary.BigEndian,&tmpipopt )
   					if err!=nil{
   						log.Println("Fail to parse IP option ",err)
   					}else{
-  						log.Printf("Org IP Option ts1: %v ts2 %v ts3: %v\n",tmpipopt.Ts1,tmpipopt.Ts2,tmpipopt.Ts3 )
+  						log.Printf("ICMP-TTL Src: %v Id: %v Option ts1: %v ts2 %v ts3: %v\n",ipv4l.SrcIP, tmpip.Id, tmpipopt.Ts1,tmpipopt.Ts2,tmpipopt.Ts3 )
+  						if tmptcp:=tmpp.Layer(layers.LayerTypeTCP); tmptcp!=nil {
+	  						tmptcpl,_:=tmptcp.(*layers.TCP)
+	  						prid:=uint16(tmptcpl.SrcPort)
+	  						if _, exist:=Probeinfo.m[prid]; exist{
+		  						Probeinfo.Lock()
+		  						Probeinfo.m[prid].RespIP = ipv4l.SrcIP
+		  						Probeinfo.m[prid].TsRecv = pkt.Metadata().CaptureInfo.Timestamp
+		  						Probeinfo.m[prid].Internetts=[]uint32{tmpipopt.Ts1,tmpipopt.Ts2,tmpipopt.Ts3}
+		  						Probeinfo.Unlock()
+		  					}else{
+		  						log.Println("id not exit", uint16(tmptcpl.SrcPort))
+		  					}
+		  				}else{
+		  					log.Println("cannot decode tcp layer")
+		  				}
+		  				goto parsefinish
   					}
   				}
   				
-  				rcount++
+  				
   			}
   		
   		//chan_response<-packet
   	}
 	}
-	if rcount==6 {
-		wg.Done()
+	parsefinish:
+	if rcount==(*Numpacket)*3 {
+		rcount++
+		print_summary()
+		wgsent.Done()
+		return true
 	}
+	return false
+}
+
+func print_summary(){
+	Probeinfo.RLock()
+	for i:=0; i<3 ; i++{
+		for j:=0; j<*Numpacket; j++{
+			pid:=uint16(25500+i*10+j)
+			rtt:=Probeinfo.m[pid].TsRecv.Sub(Probeinfo.m[pid].TsSend).Seconds()*1000
+			fmt.Printf("Probe to port %d, Hop %v, TTL %d, RTT %v ms, TS %v\n", pid, Probeinfo.m[pid].RespIP, Probeinfo.m[pid].Ttl, rtt, Probeinfo.m[pid].Internetts)
+		}
+	}
+	Probeinfo.RUnlock()
+}
+
+func waittimeout(t int, wgsent *sync.WaitGroup){
+	time.Sleep(time.Second*time.Duration(t))
+		//timeout
+	log.Println("Timeout")
+	print_summary()
+	wgsent.Done()
 }
 
 func cgtr_do(){
@@ -380,24 +453,22 @@ func main(){
 	defer handle.Close()
 	defer handlerecv.Close()
 	rcount = 0
-	chan_probe:=make(chan *CGProbe)
+	chan_probe:=make(chan *CGProbe,(*Numpacket)*3)
 	defer close(chan_probe)
 	chan_response:=make(chan *CGProbe)
 	defer close(chan_response)
 	wgpcap.Add(1)
-	go sendpcap (handle, chan_probe)
-	go recvpcap (handlerecv, chan_response)
-	wgpcap.Wait()
-	craft_packet(*LinkTTL, IPinfo, chan_probe)
-	//TTLstart int, IPmap map[string]net.IP, chan_probe chan<- *CGProbe){
 	wg.Add(1)
-	go func(){
-		time.Sleep(time.Second*5)
-		//timeout
-		wg.Done()
-		log.Println("Timeout")
-	}()
-	//wait either timeout or received 6 icmp messages
+	go sendpcap (handle, chan_probe)
+	go recvpcap (handlerecv, chan_response,&wgpcap,&wg)
+	wgpcap.Wait()
+	
+	go craft_packet(*LinkTTL, IPinfo, chan_probe)
+	//TTLstart int, IPmap map[string]net.IP, chan_probe chan<- *CGProbe){
+	
+	go waittimeout(*Tout, &wg)
+	//wait either timeout or received all icmp messages
+	log.Println("Wait until finish")
 	wg.Wait()
 	
 }
